@@ -2,12 +2,14 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+from lerobot.common.datasets.video_utils import decode_video_frames
 import numpy as np
 import torch
 
@@ -127,6 +129,109 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class LocalLeRobotDataset(Dataset):
+    """Reads a local LeRobot v3-style dataset without requiring Hub metadata files."""
+
+    def __init__(
+        self,
+        root: str | os.PathLike,
+        *,
+        action_sequence_keys: Sequence[str],
+        action_horizon: int,
+        tolerance_s: float = 1e-4,
+        video_backend: str | None = None,
+    ):
+        import pandas as pd
+
+        self.root = pathlib.Path(root).expanduser().resolve()
+        if not (self.root / "meta" / "info.json").exists():
+            raise FileNotFoundError(f"Local LeRobot dataset not found at {self.root}")
+
+        self.action_sequence_keys = tuple(action_sequence_keys)
+        self.action_horizon = action_horizon
+        self.tolerance_s = tolerance_s
+        self.video_backend = video_backend
+
+        info = pd.read_json(self.root / "meta" / "info.json", typ="series").to_dict()
+        self.fps = int(info["fps"])
+        self.video_keys = tuple(key for key, feature in info["features"].items() if feature["dtype"] == "video")
+
+        tasks_df = pd.read_parquet(self.root / "meta" / "tasks.parquet")
+        if "task" in tasks_df.columns:
+            self.tasks = {int(row["task_index"]): str(row["task"]) for _, row in tasks_df.iterrows()}
+        else:
+            self.tasks = {int(row["task_index"]): str(task) for task, row in tasks_df.iterrows()}
+
+        episode_files = sorted((self.root / "meta" / "episodes").glob("**/*.parquet"))
+        if not episode_files:
+            raise FileNotFoundError(f"No episode metadata parquet files found under {self.root / 'meta' / 'episodes'}")
+        self.episodes = (
+            pd.concat([pd.read_parquet(path) for path in episode_files], ignore_index=True)
+            .sort_values("episode_index")
+            .reset_index(drop=True)
+        )
+        self._episodes_by_index = {int(row["episode_index"]): row for _, row in self.episodes.iterrows()}
+
+        data_files = sorted((self.root / "data").glob("**/*.parquet"))
+        if not data_files:
+            raise FileNotFoundError(f"No data parquet files found under {self.root / 'data'}")
+        self.data = (
+            pd.concat([pd.read_parquet(path) for path in data_files], ignore_index=True)
+            .sort_values("index")
+            .reset_index(drop=True)
+        )
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        idx = index.__index__()
+        row = self.data.iloc[idx]
+        ep_idx = int(row["episode_index"])
+
+        item = {
+            "observation.state": np.asarray(row["observation.state"], dtype=np.float32),
+            "timestamp": np.asarray(row["timestamp"], dtype=np.float32),
+            "frame_index": np.asarray(row["frame_index"], dtype=np.int64),
+            "episode_index": np.asarray(ep_idx, dtype=np.int64),
+            "index": np.asarray(row["index"], dtype=np.int64),
+            "task_index": np.asarray(row["task_index"], dtype=np.int64),
+        }
+
+        for key in self.action_sequence_keys:
+            item[key], item[f"{key}_is_pad"] = self._get_action_sequence(key, idx, ep_idx)
+
+        for video_key in self.video_keys:
+            item[video_key] = self._decode_video_frame(video_key, row, ep_idx)
+
+        return item
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def _get_action_sequence(self, key: str, idx: int, ep_idx: int) -> tuple[np.ndarray, np.ndarray]:
+        ep_row = self._episodes_by_index[ep_idx]
+        ep_start = int(ep_row["dataset_from_index"])
+        ep_end = int(ep_row["dataset_to_index"])
+
+        indices = [min(ep_end - 1, idx + offset) for offset in range(self.action_horizon)]
+        is_pad = [(idx + offset) >= ep_end or (idx + offset) < ep_start for offset in range(self.action_horizon)]
+        values = [np.asarray(self.data.iloc[action_idx][key], dtype=np.float32) for action_idx in indices]
+        return np.stack(values, axis=0), np.asarray(is_pad, dtype=np.bool_)
+
+    def _decode_video_frame(self, video_key: str, row, ep_idx: int) -> np.ndarray:
+        ep_row = self._episodes_by_index[ep_idx]
+        prefix = f"videos/{video_key}"
+        chunk_index = int(ep_row[f"{prefix}/chunk_index"])
+        file_index = int(ep_row[f"{prefix}/file_index"])
+        start_ts = float(ep_row[f"{prefix}/from_timestamp"])
+        timestamp = start_ts + float(row["timestamp"])
+
+        video_path = self.root / "videos" / video_key / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.mp4"
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        frame = decode_video_frames(video_path, [timestamp], self.tolerance_s, self.video_backend).squeeze(0)
+        return frame.cpu().numpy()
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -136,6 +241,16 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+
+    if data_config.local_files_dir is not None:
+        dataset = LocalLeRobotDataset(
+            data_config.local_files_dir,
+            action_sequence_keys=data_config.action_sequence_keys,
+            action_horizon=action_horizon,
+        )
+        if data_config.prompt_from_task:
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset.tasks)])
+        return dataset
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
@@ -300,6 +415,7 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    # !!!!!!!!在这里进行归一化啊
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
@@ -334,6 +450,7 @@ def create_torch_data_loader(
         framework=framework,
     )
 
+    # 这里会调用/home/k202/openpi/openpi/src/openpi/models/model.py中的from_dict，对图像归一化到[-1 1]
     return DataLoaderImpl(data_config, data_loader)
 
 

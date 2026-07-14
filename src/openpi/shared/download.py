@@ -107,17 +107,35 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
 
 def _download_gsutil(url: str, local_path: pathlib.Path, **kwargs) -> None:
     """Download a file or directory from GCS using gsutil if available, otherwise fall back to gcsfs."""
-    if shutil.which("gsutil") is None:
+    gsutil = shutil.which("gsutil")
+    if gsutil is None or not _is_google_cloud_gsutil(gsutil):
         logger.warning(
-            "gsutil not found, falling back to gcsfs. This may fail if GCP credentials are not configured correctly."
+            "Google Cloud SDK gsutil not found, falling back to gcsfs. "
+            "This may fail if GCP credentials are not configured correctly."
         )
         _download_fsspec(url, local_path, **kwargs)
         return
     local_path.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["gsutil", "-m", "cp", "-r", f"{url}/*", str(local_path)],
+        [gsutil, "-m", "cp", "-r", f"{url}/*", str(local_path)],
         check=True,
     )
+
+
+def _is_google_cloud_gsutil(gsutil: str) -> bool:
+    try:
+        result = subprocess.run(
+            [gsutil, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    return result.returncode == 0 and "gsutil version:" in output
 
 
 def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:

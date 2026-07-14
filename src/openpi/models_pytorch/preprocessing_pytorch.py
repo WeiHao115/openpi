@@ -11,11 +11,10 @@ logger = logging.getLogger("openpi")
 IMAGE_KEYS = (
     "base_0_rgb",
     "left_wrist_0_rgb",
-    "right_wrist_0_rgb",
 )
 
-IMAGE_RESOLUTION = (224, 224)
 
+IMAGE_RESOLUTION = (224, 224)
 
 def preprocess_observation_pytorch(
     observation,

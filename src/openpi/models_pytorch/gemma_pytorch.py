@@ -53,7 +53,9 @@ class PaliGemmaWithExpertModel(nn.Module):
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
 
+        # VLM大模型，用来处理图像和文本
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
+        # GEMMA大模型，用来处理动作
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
@@ -87,6 +89,7 @@ class PaliGemmaWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
+    # 主干网络的前向传播
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,

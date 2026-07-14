@@ -307,11 +307,14 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    # 多卡训练相关参数
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
+    # 设置随机种子数
     set_seed(config.seed, local_rank)
 
     # Initialize checkpoint directory and wandb
+    # 训练终端后重新训练
     resuming = False
     if config.resume:
         # Find checkpoint directory based on experiment name
@@ -335,6 +338,7 @@ def train_loop(config: _config.TrainConfig):
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
+        # PI0.5基础模型权重路径
         exp_checkpoint_dir = config.checkpoint_dir
         exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
@@ -356,6 +360,8 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
+    # 根据配置文件创建数据集
+    # /home/k202/openpi/openpi/src/openpi/transforms.py中的Normalize函数定义了归一化方式
     loader, data_config = build_datasets(config)
 
     # Log sample images to wandb on first batch
@@ -365,12 +371,14 @@ def train_loop(config: _config.TrainConfig):
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
         observation, actions = sample_batch
+        # 一组数据batch
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
         # Create sample images for wandb
         images_to_log = []
         # Get batch size from the first image tensor
+        # 这里和目前自己定义的Lerobot的数据格式不一样
         batch_size = next(iter(sample_batch["image"].values())).shape[0]
         for i in range(min(5, batch_size)):
             # Concatenate all camera views horizontally for this batch item
@@ -406,6 +414,8 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
+    # 定义模型
+    print("定义模型中........")
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
@@ -439,6 +449,7 @@ def train_loop(config: _config.TrainConfig):
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
+    # 加载预训练权重
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
@@ -455,6 +466,7 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    # 使用ADAMW优化器
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=peak_lr,
@@ -469,6 +481,7 @@ def train_loop(config: _config.TrainConfig):
         global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
         logging.info(f"Resumed training from step {global_step}")
 
+    # 定义学习率衰减策略
     def lr_schedule(step: int):
         if step < warmup_steps:
             # Match JAX behavior: start from peak_lr / (warmup_steps + 1)
@@ -506,6 +519,7 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    loss_list = []
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
@@ -534,7 +548,8 @@ def train_loop(config: _config.TrainConfig):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
             loss = losses.mean()
-
+            loss_list.append(loss.detach().cpu().numpy())
+            np.savetxt("/home/k202/openpi/openpi/loss.txt", np.array(loss_list))
             # Backward pass
             loss.backward()
 

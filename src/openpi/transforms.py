@@ -111,6 +111,7 @@ class InjectDefaultPrompt(DataTransformFn):
         return data
 
 
+# 这里定义了数据归一化的方式，包括不归一化、普通归一化以及QUANT归一化
 @dataclasses.dataclass(frozen=True)
 class Normalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None
@@ -145,6 +146,7 @@ class Normalize(DataTransformFn):
         return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
 
 
+# 这里定义了数据反归一化的方式，包括不归一化、普通归一化以及QUANT归一化
 @dataclasses.dataclass(frozen=True)
 class Unnormalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None

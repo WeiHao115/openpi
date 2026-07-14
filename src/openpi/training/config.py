@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -65,9 +66,12 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional local LeRobot dataset root. When set, repo_id is used only as an identifier.
+    local_files_dir: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
+    # 归一化相关参数
     norm_stats: dict[str, _transforms.NormStats] | None = None
 
     # Used to adopt the inputs from a dataset specific format to a common format
@@ -80,6 +84,7 @@ class DataConfig:
     # Model specific transforms. Will be applied after the data is normalized.
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
+    # QUAD归一化
     use_quantile_norm: bool = False
 
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
@@ -183,6 +188,7 @@ class DataConfigFactory(abc.ABC):
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
+            # 决定了状态数据和动作数据的归一化方式， PI0使用mean/std 归一化，PI05使用quantile归一化
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
@@ -461,6 +467,74 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+# 在这里将图像键名与实际需要额键名对齐
+@dataclasses.dataclass(frozen=True)
+class PlugInputs(_transforms.DataTransformFn):
+    model_type: ModelType
+
+    def __call__(self, data: _transforms.DataDict) -> _transforms.DataDict:
+        state = np.asarray(data["observation/state"], dtype=np.float32)
+        droid_like = {
+            "observation/exterior_image_1_left": data["observation/images/realsense"],
+            "observation/wrist_image_left": data["observation/images/gopro"],
+            "observation/joint_position": state[..., :6],
+            "observation/gripper_position": state[..., 6:7],
+        }
+        if "actions" in data:
+            droid_like["actions"] = np.asarray(data["actions"], dtype=np.float32)
+        if "prompt" in data:
+            droid_like["prompt"] = data["prompt"]
+        inputs = droid_policy.DroidInputs(model_type=self.model_type)(droid_like)
+        inputs["image"].pop("right_wrist_0_rgb", None)
+        inputs["image_mask"].pop("right_wrist_0_rgb", None)
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class PlugOutputs(_transforms.DataTransformFn):
+    def __call__(self, data: _transforms.DataDict) -> _transforms.DataDict:
+        return {"actions": np.asarray(data["actions"][..., :7])}
+
+
+# Modified by DK, 定义了数据集的路径
+@dataclasses.dataclass(frozen=True)
+class LeRobotPlugDataConfig(DataConfigFactory):
+    # repo_id变量决定了assert中norm_state的路径
+    repo_id: str = "pi05_lerobot_C16_ethernet_cable"
+    local_files_dir: str = "/home/k202/0712_c16_lerobotdataset/Plug the Ethernet cable into the Ethernet port"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/images/gopro": "observation.images.gopro",
+                        "observation/images/realsense": "observation.images.realsense",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "task_index": "task_index",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[PlugInputs(model_type=model_config.model_type)],
+            outputs=[PlugOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            local_files_dir=self.local_files_dir,
+            prompt_from_task=True,
+            action_sequence_keys=("action",),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -480,9 +554,11 @@ class TrainConfig:
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
 
     # Optional path to a PyTorch checkpoint to load weights from.
+    # 预训练权重路径
     pytorch_weight_path: str | None = None
 
     # Precision for PyTorch training.
+    # 训练精度，选择bfloat16
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
@@ -496,8 +572,10 @@ class TrainConfig:
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
     # Base directory for config assets (e.g., norm stats).
+    # 保存相关数据（比如归一化数值）的路径
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
+    # 保存权重的路径
     checkpoint_base_dir: str = "./checkpoints"
 
     # Random seed that will be used by random generators during training.
@@ -508,6 +586,7 @@ class TrainConfig:
     # will increase memory and CPU usage.
     num_workers: int = 2
     # Number of train steps (batches) to run.
+    # 训练的迭代次数
     num_train_steps: int = 30_000
 
     # How often (in steps) to log training metrics.
@@ -520,6 +599,7 @@ class TrainConfig:
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
+    # 训练终端后重新训练
     resume: bool = False
 
     # If true, will enable wandb logging.
@@ -915,6 +995,33 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+
+    # Modified by DK
+    TrainConfig(
+        # 决定了asserts中归一化文件的路径
+        name="pi05_lerobot_C16_ethernet_cable",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotPlugDataConfig(),
+        # 预训练权重路径
+        pytorch_weight_path="/home/k202/openpi_pi05",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=30_000,
+        batch_size=8,
+        num_workers=0,
+        log_interval=20,
+        save_interval=1000,
+        keep_period=5000,
+        wandb_enabled=False,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
